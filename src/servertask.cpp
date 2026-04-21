@@ -1,4 +1,5 @@
 #include "servertask.hpp"
+#include "httpparser.hpp"
 #include "threadpool.hpp"
 #include <arpa/inet.h>
 #include <cerrno>
@@ -10,10 +11,55 @@
 #include <mutex>
 #include <netinet/in.h>
 #include <stdexcept>
+#include <string>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <vector>
+
+#define STATIC_FILE "/home/l/code/exercise/serverTask/files"
+
+std::string SafePathJoin(const std::string &path) {
+  if (path.find("..") != std::string::npos)
+    return "";
+  std::string real_path = STATIC_FILE;
+  if (path == "/")
+    real_path += "/index.html";
+  else
+    real_path += path;
+  return real_path;
+}
+
+std::string GetMimeType(const std::string &path) {
+  size_t pos = path.find_last_of('.');
+  if (pos == std::string::npos)
+    return "application/octet-stream";
+  if (path.compare(pos, 5, ".html") == 0)
+    return "text/html";
+  if (path.compare(pos, 4, ".css") == 0)
+    return "text/css";
+  if (path.compare(pos, 3, ".js") == 0)
+    return "application/javascript";
+  if (path.compare(pos, 4, ".jpg") == 0)
+    return "image/jpeg";
+  if (path.compare(pos, 5, ".jpeg") == 0)
+    return "image/jpeg";
+  if (path.compare(pos, 4, ".png") == 0)
+    return "image/png";
+  if (path.compare(pos, 4, ".gif") == 0)
+    return "image/gif";
+  if (path.compare(pos, 4, ".txt") == 0)
+    return "text/plain";
+  return "application/octet-stream"; // 未知类型
+}
+
+bool CheckFile(const std::string &path) {
+  // 只能确定存在, 不保证并发安全
+  if (access(path.c_str(), F_OK) == 0)
+    return true;
+  else
+    return false;
+}
 
 void EpollServer::ReleaseConn(int fd) {
   std::lock_guard<std::mutex> lock(conn_map_mux_);
@@ -60,32 +106,44 @@ void EpollServer::HandleAccept() {
 }
 
 size_t EpollServer::SendData(std::shared_ptr<ConnContext> ctx) {
-  if (ctx->write_buf_.empty())
-    return 0;
-  const char *send_buf = ctx->write_buf_.data();
-  size_t sent = 0;
-  size_t buf_len = ctx->write_buf_.size();
-  while (buf_len > 0) {
-    // 返回值为0意味着发送了0个数据
-    int send_ret = send(ctx->fd_, send_buf, buf_len, MSG_NOSIGNAL);
-    if (send_ret > 0) {
-      sent += send_ret;
-      send_buf += send_ret;
-      buf_len -= send_ret;
-    } else if (send_ret == 0) {
-      break;
-    } else {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+  size_t total_sent = 0;
+  if (!ctx->write_buf_.empty()) {
+    const char *buf = ctx->write_buf_.data();
+    size_t len = ctx->write_buf_.size();
+    while (len > 0) {
+      size_t sent = send(ctx->fd_, buf, len, MSG_NOSIGNAL);
+      if (sent <= 0)
         break;
-      } else {
-        std::cerr << "send failed: " << strerror(errno) << '\n';
-        return 0;
+      buf += sent;
+      total_sent += sent;
+      len -= sent;
+    }
+    if (total_sent > 0)
+      ctx->write_buf_.erase(0, total_sent);
+    if (!ctx->write_buf_.empty())
+      return total_sent;
+  }
+
+  if (ctx->is_sending_file_ && ctx->file_.is_open()) {
+    char buf[4096];
+    while (true) {
+      ctx->file_.read(buf, sizeof(buf));
+      size_t read_len = ctx->file_.gcount();
+      if (read_len == 0)
+        break; // 文件读完
+      size_t sent = send(ctx->fd_, buf, read_len, MSG_NOSIGNAL);
+      if (sent <= 0)
+        break;
+      total_sent += sent;
+      ctx->file_sent_ += sent;
+      if (ctx->file_sent_ >= ctx->file_size_) {
+        ctx->file_.close();
+        ctx->is_sending_file_ = false;
+        break;
       }
     }
   }
-  if (sent > 0)
-    ctx->write_buf_.erase(0, sent);
-  return sent;
+  return total_sent;
 }
 
 bool EpollServer::ResetOneShot(std::shared_ptr<ConnContext> ctx,
@@ -117,12 +175,14 @@ void EpollServer::HandleWrite(std::shared_ptr<ConnContext> ctx) {
 void EpollServer::HandleRead(std::shared_ptr<ConnContext> ctx) {
   if (!ctx || ctx->fd_ == -1)
     return;
+  // 这里需要注意buf的定义, 不是数组而是一个对象
   std::vector<char> buf(BUF_SIZE);
   bool is_close{false};
   {
     std::lock_guard<std::mutex> lock(ctx->conn_mux_);
     while (true) {
-      // recv返回值为0则意味着客户端关闭
+      // recv返回值为0则意味着客户端关闭,
+      // 最后这个宏定义表示即使客户端发送退出消息也不会关闭服务器
       int recv_ret = recv(ctx->fd_, buf.data(), BUF_SIZE - 1, MSG_NOSIGNAL);
       if (recv_ret > 0) {
         ctx->read_buf_.append(buf.data(), recv_ret);
@@ -145,13 +205,57 @@ void EpollServer::HandleRead(std::shared_ptr<ConnContext> ctx) {
     ReleaseConn(ctx->fd_);
     return;
   }
-  // 回声
-  if (!ctx->read_buf_.empty()) {
-    ctx->write_buf_.append(ctx->read_buf_);
-    ctx->read_buf_.erase(0, ctx->read_buf_.size());
+
+  ctx->http_parser_.AttachReadBuffer(&ctx->read_buf_);
+  ParserState state = ctx->http_parser_.Parser(nullptr, 0);
+  if (state == ParserState::COMPLETE) {
+    const auto &req = ctx->http_parser_.GetHttpRequest();
+    HttpResponse response;
+    std::string file_path = SafePathJoin(req.request_path_);
+    size_t file_size = 0;
+    if (!file_path.empty() && CheckFile(file_path)) {
+      ctx->file_.open(file_path, std::ios::binary | std::ios::in);
+      if (ctx->file_.is_open()) {
+
+        ctx->file_.seekg(0, std::ios::end);
+        auto file_size_tmp = ctx->file_.tellg();
+        if (file_size_tmp < 0) {
+          ctx->file_size_ = 0;
+        } else {
+          ctx->file_size_ = static_cast<size_t>(file_size_tmp);
+        }
+        ctx->file_.seekg(0, std::ios::beg);
+        ctx->is_sending_file_ = true;
+        ctx->file_sent_ = 0;
+
+        response.SetStatus(200, "OK")
+            .SetHead("Content-Type", GetMimeType(file_path))
+            .SetHead("Content-Length", std::to_string(ctx->file_size_))
+            .SetHead("Connection", req.IsKeepAlive() ? "keep-alive" : "close");
+
+        ctx->write_buf_ = response.Serialize();
+      }
+    } else {
+      HttpResponse response;
+      response.SetStatus(404, "Not Found")
+          .SetHead("Content-Type", "text/html")
+          .SetBody("<h1>404 FILE Not Found</h1>");
+      ctx->write_buf_ = response.Serialize();
+    }
+    // 清除数据并发送
+    ctx->read_buf_.erase(0, ctx->http_parser_.GetParserOffset());
+    ctx->http_parser_.Reset();
+    ResetOneShot(ctx, EPOLLIN | EPOLLOUT);
+  } else if (state == ParserState::ERROR) {
+    HttpResponse response;
+    response.SetVersion(HttpVersion::HTTP_1_1)
+        .SetStatus(400, "Bad Request")
+        .SetBody("400 Bad Request: Invalid HTTP Format")
+        .SetHead("Connection", "close");
+    ctx->write_buf_ = response.Serialize();
     ResetOneShot(ctx, EPOLLIN | EPOLLOUT);
   } else {
-    EpollCTL(EPOLL_CTL_MOD, EPOLLIN | EPOLLET | EPOLLONESHOT, ctx);
+    ResetOneShot(ctx, EPOLLIN);
   }
 }
 

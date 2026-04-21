@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdio>
 #ifndef THREADPOOL_HPP
 #define THREADPOOL_HPP
 #include <atomic>
@@ -28,6 +29,7 @@ public:
   }
 
   bool is_exit() { return is_exit_; }
+
   template <class Func, class... Arg>
   auto AddTask(Func &&func, Arg &&...arg)
       -> std::future<std::invoke_result_t<Func, Arg...>> {

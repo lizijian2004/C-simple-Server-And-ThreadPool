@@ -1,9 +1,11 @@
 #pragma once
 #ifndef SERVERTASK_HPP
 #define SERVERTASK_HPP
+#include "httpparser.hpp"
 #include "threadpool.hpp"
 #include <atomic>
 #include <cstddef>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <netinet/in.h>
@@ -15,13 +17,19 @@ struct ConnContext {
   int fd_;
   int epoll_;
   sockaddr_in addr_;
-  std::string read_buf_;
-  std::string write_buf_;
+  std::string read_buf_;  // 从客户端获取的数据
+  std::string write_buf_; // 发送到客户端的数据
   std::mutex conn_mux_;
+  HttpParser http_parser_;
+  std::ifstream file_;           // 文件读取流
+  size_t file_size_ = 0;         // 文件总大小
+  size_t file_sent_ = 0;         // 已发送大小
+  bool is_sending_file_ = false; // 是否正在发送文件
   ConnContext(int epoll, int fd, const sockaddr_in &addr)
       : epoll_(epoll), fd_(fd), addr_(addr) {};
   ~ConnContext() {
     if (fd_ > 0) {
+      file_.close();
       close(fd_);
     }
     fd_ = -1;
